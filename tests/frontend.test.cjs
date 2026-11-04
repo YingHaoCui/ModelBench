@@ -57,3 +57,16 @@ test('report explains absent usage and preserves unknown token counts', () => {
   assert.match(text,/未缓存输入/);
   assert.match(text,/—/);
 });
+
+test('selecting a provider applies endpoint and clears another provider key', () => {
+  const {context,elements}=ui();
+  const inputs={base_url:{value:''},model:{value:''}};
+  elements.get('config').elements={namedItem(name){return inputs[name];}};
+  context.document.getElementById('provider-select').value='saved';
+  context.document.getElementById('api-key').value='old-key';
+  vm.runInContext("providers=[{id:'saved',name:'Local',base_url:'http://localhost/v1',model:'m',has_api_key:true}]; $('provider-select').onchange();",context);
+  assert.equal(inputs.base_url.value,'http://localhost/v1');
+  assert.equal(inputs.model.value,'m');
+  assert.equal(elements.get('api-key').value,'');
+  assert.match(elements.get('provider-info').textContent,/已保存 API Key/);
+});

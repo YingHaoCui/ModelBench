@@ -9,6 +9,8 @@ async function api(path, body) {
 }
 function notify(error) {$('notice').textContent = error?.message || error || '';}
 function fill(config) {
+  $('provider-select').value = '';
+  providerStatus();
   $('api-key').value = '';
   for (const [key,value] of Object.entries(config)) {
     const input = form.elements.namedItem(key);
@@ -89,12 +91,62 @@ async function refresh() {
   metrics(data);renderReport(data.summary ?? data.progress);
   if(data.error) $('report').prepend(element('p',data.error));
 }
-form.onsubmit=async event=>{event.preventDefault();$('start').disabled=true;notify('');try{const run=await api('runs',{...config(),api_key:$('api-key').value.trim()});$('api-key').value='';selected=run.id;await refresh();}catch(error){notify(error);$('start').disabled=busy;}};
+form.onsubmit=async event=>{event.preventDefault();$('start').disabled=true;notify('');try{const run=await api('runs',{...config(),...($('provider-select').value ? {provider_id:$('provider-select').value} : {}),api_key:$('api-key').value.trim()});$('api-key').value='';selected=run.id;await refresh();}catch(error){notify(error);$('start').disabled=busy;}};
 $('preview').onclick=async()=>{if(!form.reportValidity())return;const button=$('preview');button.disabled=true;notify('');try{$('payload').textContent=JSON.stringify(await api('preview',config()),null,2);$('preview-dialog').showModal();}catch(error){notify(error);}finally{button.disabled=false;}};
 $('close-preview').onclick=()=>$('preview-dialog').close();
 $('stop').onclick=async()=>{$('stop').disabled=true;try{await api('runs/'+selected+'/stop',{});await refresh();}catch(error){notify(error);}};
 $('reuse').onclick=()=>{if(current){fill(current.config);form.scrollIntoView({block:'start'});notify('已复用配置；尚未启动新任务。');}};
 $('refresh').onclick=()=>refresh().catch(notify);
 async function poll(){try{await refresh();}catch(error){notify('连接失败：'+error.message);}finally{setTimeout(poll,2000);}}
-async function init(){defaults=await api('defaults');fill(defaults);metrics(null);await poll();}
+let providers = [], editingProvider = null;
+function providerStatus() {
+  const provider=providers.find(p=>p.id===$('provider-select').value);
+  $('provider-edit').disabled=$('provider-delete').disabled=!provider;
+  $('provider-info').textContent=provider ? `${provider.name} · ${provider.has_api_key?'已保存 API Key（不回显）':'未保存密钥，使用本次输入或环境变量'}` : '手动配置；仅点击保存供应商才会持久保存密钥。';
+}
+async function loadProviders(selectId) {
+  providers=await api('providers');
+  const currentId=selectId ?? $('provider-select').value;
+  const options=[element('option','手动配置（不保存）')];options[0].value='';
+  for(const p of providers){const option=element('option',p.name);option.value=p.id;options.push(option);}
+  $('provider-select').replaceChildren(...options);
+  $('provider-select').value=providers.some(p=>p.id===currentId)?currentId:'';
+  providerStatus();
+}
+$('provider-select').onchange=()=>{
+  const p=providers.find(p=>p.id===$('provider-select').value);
+  if(p){form.elements.namedItem('base_url').value=p.base_url;form.elements.namedItem('model').value=p.model;}
+  $('api-key').value='';providerStatus();
+};
+function openProvider(edit) {
+  editingProvider=edit?providers.find(p=>p.id===$('provider-select').value):null;
+  if(edit&&!editingProvider)return;
+  $('provider-title').textContent=edit?'编辑模型供应商':'保存为新供应商';
+  $('provider-name').value=editingProvider?.name ?? '';
+  $('provider-url').value=editingProvider?.base_url ?? form.elements.namedItem('base_url').value;
+  $('provider-model').value=editingProvider?.model ?? form.elements.namedItem('model').value;
+  $('provider-key').value=edit?'':$('api-key').value;
+  $('provider-clear').checked=false;$('provider-error').textContent='';
+  $('provider-dialog').showModal();
+}
+$('provider-new').onclick=()=>openProvider(false);
+$('provider-edit').onclick=()=>openProvider(true);
+$('provider-close').onclick=()=>{$('provider-key').value='';$('provider-dialog').close();};
+$('provider-dialog').onclose=()=>{$('provider-key').value='';};
+$('provider-form').onsubmit=async event=>{
+  event.preventDefault();$('provider-save').disabled=true;
+  try {
+    const p=await api(editingProvider?'providers/'+editingProvider.id:'providers',{
+      name:$('provider-name').value.trim(),base_url:$('provider-url').value.trim(),model:$('provider-model').value.trim(),
+      api_key:$('provider-key').value.trim(),clear_api_key:$('provider-clear').checked});
+    await loadProviders(p.id);$('provider-select').onchange();
+    $('provider-key').value='';$('provider-dialog').close();notify('供应商已保存，可用于后续压测。');
+  } catch(error) {$('provider-error').textContent=error.message;} finally {$('provider-save').disabled=false;}
+};
+$('provider-delete').onclick=async()=>{
+  const p=providers.find(p=>p.id===$('provider-select').value);if(!p)return;
+  if(!confirm(`删除供应商“${p.name}”及其保存的密钥？已有压测记录不受影响。`))return;
+  try{await api('providers/'+p.id+'/delete',{});await loadProviders('');notify('供应商已删除。');}catch(error){notify(error);}
+};
+async function init(){defaults=await api('defaults');fill(defaults);await loadProviders();metrics(null);await poll();}
 init().catch(notify);

@@ -71,14 +71,54 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def validate_key(value):
+    if not isinstance(value, str) or len(value) > 8192 or any(ord(c) < 32 or ord(c) > 126 for c in value):
+        raise ValueError("API Key 格式无效")
+    return value.strip()
+
+
 class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, created TEXT NOT NULL, status TEXT NOT NULL, config TEXT NOT NULL, summary TEXT, error TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', updated TEXT NOT NULL)")
+        self.db.execute("PRAGMA user_version=1")
         self.db.execute("UPDATE runs SET status='interrupted', error='服务重启，原任务已中断' WHERE status IN ('running','stopping')")
         self.db.commit()
+
+    def provider(self, pid, secret=False):
+        row = self.db.execute("SELECT * FROM providers WHERE id=?", (pid,)).fetchone()
+        if row is None:
+            raise web.HTTPNotFound(text="供应商不存在")
+        result = dict(row)
+        result["has_api_key"] = bool(result["api_key"])
+        if not secret:
+            result.pop("api_key")
+        return result
+
+    def save_provider(self, payload, pid=None):
+        if not isinstance(payload, dict) or set(payload) - {"name", "base_url", "model", "api_key", "clear_api_key"}:
+            raise ValueError("供应商配置包含未知字段")
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 100:
+            raise ValueError("请输入供应商名称（最多 100 字符）")
+        config = validate({"base_url": payload.get("base_url"), "model": payload.get("model")})
+        key = validate_key(payload.get("api_key", ""))
+        clear = payload.get("clear_api_key", False)
+        if type(clear) is not bool or (clear and key):
+            raise ValueError("清除密钥与新密钥不能同时设置")
+        old = self.provider(pid, secret=True) if pid else None
+        if old and old["api_key"] and old["base_url"] != config["base_url"] and not key and not clear:
+            raise ValueError("更改 API 地址时请重新输入或清除密钥")
+        if old and not key and not clear:
+            key = old["api_key"]
+        pid = pid or str(uuid.uuid4())
+        self.db.execute("INSERT INTO providers VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, base_url=excluded.base_url, model=excluded.model, api_key=excluded.api_key, updated=excluded.updated",
+                        (pid, name.strip(), config["base_url"], config["model"], key, now()))
+        self.db.commit()
+        return self.provider(pid)
 
     def insert(self, rid, config):
         self.db.execute("INSERT INTO runs VALUES (?,?,?,?,NULL,NULL)", (rid, now(), "running", json.dumps(config)))
@@ -211,11 +251,33 @@ def create_app(data=ROOT / "data"):
         payload = await request.json()
         if not isinstance(payload, dict):
             raise ValueError("请求必须是对象")
-        api_key = payload.pop("api_key", "")
-        if not isinstance(api_key, str) or len(api_key) > 8192 or any(ord(c) < 32 or ord(c) > 126 for c in api_key):
-            raise ValueError("API Key 格式无效")
-        rid = await manager.start(validate(payload), api_key.strip())
+        api_key = validate_key(payload.pop("api_key", ""))
+        provider_id = payload.pop("provider_id", None)
+        if provider_id is not None:
+            if not isinstance(provider_id, str):
+                raise ValueError("供应商 ID 无效")
+            provider = manager.store.provider(provider_id, secret=True)
+            if payload.get("base_url", provider["base_url"]) != provider["base_url"]:
+                raise ValueError("地址与所选供应商不一致，请选择手动配置或更新供应商")
+            payload.setdefault("base_url", provider["base_url"])
+            payload.setdefault("model", provider["model"])
+            api_key = api_key or provider["api_key"]
+        rid = await manager.start(validate(payload), api_key)
         return web.json_response(manager.store.get(rid), status=201)
+
+    async def providers(request):
+        ids = manager.store.db.execute("SELECT id FROM providers ORDER BY name, id").fetchall()
+        return web.json_response([manager.store.provider(row["id"]) for row in ids])
+
+    async def save_provider(request):
+        return web.json_response(manager.store.save_provider(await request.json(), request.match_info.get("pid")))
+
+    async def delete_provider(request):
+        pid = request.match_info["pid"]
+        manager.store.provider(pid)
+        manager.store.db.execute("DELETE FROM providers WHERE id=?", (pid,))
+        manager.store.db.commit()
+        return web.json_response({"deleted": True})
 
     async def listing(request):
         rows = manager.store.db.execute("SELECT id, created, status, error FROM runs ORDER BY created DESC LIMIT 100").fetchall()
@@ -248,6 +310,9 @@ def create_app(data=ROOT / "data"):
         await manager.close()
 
     app.add_routes([web.get("/", index), web.get("/api/defaults", defaults),
+                    web.get("/api/providers", providers), web.post("/api/providers", save_provider),
+                    web.post("/api/providers/{pid}", save_provider),
+                    web.post("/api/providers/{pid}/delete", delete_provider),
                     web.post("/api/preview", preview), web.get("/api/runs", listing),
                     web.post("/api/runs", start), web.get("/api/runs/{rid}", detail),
                     web.post("/api/runs/{rid}/stop", stop),

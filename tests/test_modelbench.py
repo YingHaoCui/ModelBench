@@ -259,3 +259,55 @@ def test_restart_marks_interrupted(tmp_path):
     store=Store(tmp_path/'test.sqlite3')
     assert store.get('test')['status']=='interrupted'
     store.db.close()
+
+
+async def test_provider_crud_persistence_and_secrets(tmp_path):
+    secret='provider-secret-local-test'
+    payload={'name':'Local test','base_url':'http://127.0.0.1:8000/v1','model':'mock','api_key':secret}
+    async with TestClient(TestServer(create_app(tmp_path))) as client:
+        response=await client.post('/api/providers',json=payload)
+        assert response.status==200
+        saved=await response.json()
+        pid=saved['id']
+        assert saved['has_api_key'] and 'api_key' not in saved
+        assert secret not in await (await client.get('/api/providers')).text()
+        edited={**payload,'name':'Renamed','api_key':''}
+        assert (await client.post('/api/providers/'+pid,json=edited)).status==200
+        assert (await client.post('/api/providers/'+pid,json={**edited,'base_url':'http://other.example/v1'})).status==400
+    store=Store(tmp_path/'modelbench.sqlite3')
+    assert store.provider(pid,secret=True)['api_key']==secret
+    assert store.provider(pid)['name']=='Renamed'
+    store.db.close()
+    async with TestClient(TestServer(create_app(tmp_path))) as client:
+        rows=await (await client.get('/api/providers')).json()
+        assert rows[0]['has_api_key'] is True
+        assert (await client.post('/api/runs',json={'provider_id':pid,'base_url':'http://other.example/v1'})).status==400
+        assert (await client.post('/api/providers/'+pid,json={**edited,'clear_api_key':True})).status==200
+        assert not (await (await client.get('/api/providers')).json())[0]['has_api_key']
+        assert (await client.post('/api/providers/'+pid+'/delete',json={})).status==200
+        assert await (await client.get('/api/providers')).json()==[]
+        assert (await client.post('/api/runs',json={'provider_id':pid})).status==404
+
+
+async def test_provider_reused_for_two_runs(tmp_path):
+    upstream=mock_app()
+    async with TestServer(upstream) as mock:
+        async with TestClient(TestServer(create_app(tmp_path))) as client:
+            provider=await (await client.post('/api/providers',json={'name':'Mock','base_url':str(mock.make_url('/v1')),
+                'model':'mock','api_key':'saved-provider-key'})).json()
+            for _ in range(2):
+                response=await client.post('/api/runs',json={'provider_id':provider['id'],'sessions':1,'concurrency':1,
+                    'turns':1,'context_chars':100,'tool_chars':50,'ramp_seconds':0})
+                assert response.status==201
+                row=await response.json()
+                rid=row['id']
+                for _ in range(60):
+                    row=await (await client.get('/api/runs/'+rid)).json()
+                    if row['status'] not in ('running','stopping'):break
+                    await asyncio.sleep(.1)
+                assert row['status']=='completed'
+                assert row['config']['model']=='mock'
+                assert 'saved-provider-key' not in json.dumps(row)
+                for artifact in (tmp_path/rid).iterdir():
+                    assert b'saved-provider-key' not in artifact.read_bytes()
+    assert upstream['authorization']==['Bearer saved-provider-key']*2
