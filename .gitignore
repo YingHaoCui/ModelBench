@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+results/
+*.local.jsonl
+data/
+.test-tmp*/
+frontend-preview.jpg
+.env
+.env.*
+!.env.example
