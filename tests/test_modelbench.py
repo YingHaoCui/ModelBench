@@ -7,7 +7,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from bench import parser, request, run, sse_events, summarize, usage_metrics
+from bench import live_snapshot, parser, request, run, sse_events, summarize, usage_metrics
 from server import Store, create_app, validate
 from workloads import advance, body_for, initial_messages
 
@@ -42,6 +42,71 @@ def test_usage_is_not_guessed():
     assert usage_metrics({'prompt_tokens': 100, 'prompt_cache_hit_tokens': 60})['cache_hit_ratio'] == .6
     assert usage_metrics({'prompt_tokens': 100, 'prompt_tokens_details': {'cached_tokens': 0}})['cached_tokens'] == 0
     assert usage_metrics({'prompt_tokens': 10, 'prompt_tokens_details': {'cached_tokens': 20}})['cached_tokens'] is None
+
+
+def test_harness_style_usage_buckets():
+    usage = usage_metrics({'prompt_tokens':100, 'completion_tokens':20,
+        'prompt_cache_hit_tokens':60, 'prompt_cache_miss_tokens':40,
+        'completion_tokens_details':{'reasoning_tokens':12}})
+    assert usage['uncached_tokens'] == 40
+    assert usage['reasoning_tokens'] == 12
+    assert usage['total_tokens'] == 120
+    assert usage_metrics({})['uncached_tokens'] is None
+
+
+async def test_first_token_is_published_before_request_completes(tmp_path):
+    release = asyncio.Event()
+    first_sent = asyncio.Event()
+    async def handle(req):
+        await req.json()
+        response = web.StreamResponse(headers={'Content-Type':'text/event-stream'})
+        await response.prepare(req)
+        await response.write(b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n')
+        first_sent.set()
+        await release.wait()
+        await response.write(b'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_cache_hit_tokens":60,"completion_tokens_details":{"reasoning_tokens":4}}}\n\n')
+        await response.write(b'data: [DONE]\n\n')
+        return response
+    app=web.Application()
+    app.router.add_post('/v1/chat/completions',handle)
+    async with TestServer(app) as mock:
+        args=args_for(tmp_path)
+        args.concurrency=args.sessions=args.turns=1
+        args.base_url=str(mock.make_url('/v1'))
+        task=asyncio.create_task(run(args))
+        try:
+            await asyncio.wait_for(first_sent.wait(),3)
+            for _ in range(40):
+                paths=list(tmp_path.glob('*/progress.json'))
+                if paths:
+                    progress=json.loads(paths[0].read_text())
+                    break
+                await asyncio.sleep(.05)
+            assert progress['requests'] == 0
+            assert progress['streaming'] == 1
+            assert progress['waiting_first_token'] == 0
+            assert progress['observed_ttft_ms']['count'] == 1
+            assert progress['observed_ttft_ms']['mean'] > 0
+            assert progress['token_totals']['completion_tokens']['value'] is None
+        finally:
+            release.set()
+            await asyncio.wait_for(task,5)
+    summary=json.loads(next(tmp_path.glob('*/summary.json')).read_text())
+    assert summary['first_reasoning_ms']['count'] == 1
+    assert summary['generation_ms']['mean'] > 0
+    assert summary['weighted_decode_tokens_per_s'] > 0
+    assert summary['token_totals']['cached_tokens']['value'] == 60
+    assert summary['token_totals']['uncached_tokens']['value'] == 40
+    assert summary['token_totals']['reasoning_tokens']['value'] == 4
+    assert summary['recent_requests'][0]['ttft_ms'] > 0
+
+
+def test_live_failure_ttft_not_hidden():
+    args = {'ok':False,'session_id':'s','backend':None,'e2e_ms':100,'ttft_ms':30,'error':'incomplete_stream'}
+    snapshot=live_snapshot([args],{'active':{'ttft_ms':50}},1,1,[])
+    assert snapshot['ttft_ms']['count'] == 0
+    assert snapshot['observed_ttft_ms']['count'] == 2
+    assert snapshot['observed_ttft_ms']['mean'] == 40
 
 
 @pytest.mark.parametrize('overrides', [{'concurrency': 2001}, {'concurrency': True}, {'duration': float('nan')},

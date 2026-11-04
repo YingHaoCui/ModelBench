@@ -35,7 +35,8 @@ async def sse_events(content):
 def usage_metrics(usage):
     prompt = usage.get("prompt_tokens")
     completion = usage.get("completion_tokens")
-    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    prompt_details = usage.get("prompt_tokens_details")
+    cached = prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
     source = "usage.prompt_tokens_details.cached_tokens" if cached is not None else None
     if cached is None and usage.get("prompt_cache_hit_tokens") is not None:
         cached = usage["prompt_cache_hit_tokens"]
@@ -45,16 +46,31 @@ def usage_metrics(usage):
     prompt = prompt if valid(prompt) else None
     completion = completion if valid(completion) else None
     cached = cached if valid(cached) and (prompt is None or cached <= prompt) else None
+    miss = usage.get("prompt_cache_miss_tokens")
+    miss = miss if valid(miss) else prompt - cached if prompt is not None and cached is not None else None
+    details = usage.get("completion_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    reasoning = details.get("reasoning_tokens")
+    reasoning = reasoning if valid(reasoning) else None
+    total = usage.get("total_tokens")
+    total = total if valid(total) else prompt + completion if prompt is not None and completion is not None else None
     return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "uncached_tokens": miss, "reasoning_tokens": reasoning, "total_tokens": total,
             "cached_tokens": cached, "cache_metric_source": source if cached is not None else None,
             "cache_hit_ratio": cached / prompt if cached is not None and prompt else None}
 
 
-async def request(client, url, body, headers, args):
+async def request(client, url, body, headers, args, observed=None):
     start = time.perf_counter()
     result = {"ok": False, "status": None, "ttft_ms": None, "tpot_ms": None,
               "output_chunks": 0, "chunk_gap_mean_ms": None, "finish_reason": None,
               "backend": None, "server_request_id": None}
+    if observed is not None:
+        observed.update(result)
+        result = observed
+    result.update(headers_ms=None, generation_ms=None, decode_tokens_per_s=None,
+                  first_text_ms=None, first_reasoning_ms=None, tool_calls_count=0,
+                  text_chars=0, reasoning_chars=0, tool_argument_chars=0, sse_events=0)
     first = last = None
     gaps = []
     content, reasoning, calls = [], [], {}
@@ -62,6 +78,7 @@ async def request(client, url, body, headers, args):
     done = False
     try:
         async with client.post(url, json=body, headers=headers, allow_redirects=False) as response:
+            result["headers_ms"] = (time.perf_counter() - start) * 1000
             result["status"] = response.status
             result["backend"] = response.headers.get(args.backend_header) if args.backend_header else None
             result["server_request_id"] = response.headers.get("x-request-id")
@@ -71,6 +88,7 @@ async def request(client, url, body, headers, args):
             if "text/event-stream" not in response.headers.get("Content-Type", ""):
                 raise ValueError("expected_sse_content_type")
             async for event in sse_events(response.content):
+                result["sse_events"] += 1
                 if event.strip() == "[DONE]":
                     done = True
                     break
@@ -89,6 +107,10 @@ async def request(client, url, body, headers, args):
                     for field, target in (("content", content), ("reasoning_content", reasoning)):
                         if delta.get(field):
                             target.append(delta[field])
+                            kind = "text" if field == "content" else "reasoning"
+                            result[f"{kind}_chars"] += len(delta[field])
+                            if result[f"first_{kind}_ms"] is None:
+                                result[f"first_{kind}_ms"] = (time.perf_counter() - start) * 1000
                             output = True
                     for part in delta.get("tool_calls", []):
                         call = calls.setdefault(part["index"], {"id": "", "type": "function",
@@ -98,11 +120,14 @@ async def request(client, url, body, headers, args):
                         for field in ("name", "arguments"):
                             value = part.get("function", {}).get(field, "")
                             call["function"][field] += value
+                            if field == "arguments":
+                                result["tool_argument_chars"] += len(value)
                             output |= bool(value)
                 if output:
                     now = time.perf_counter()
                     if first is None:
                         first = now
+                        result["ttft_ms"] = (first - start) * 1000
                     if last is not None:
                         gaps.append((now - last) * 1000)
                     last = now
@@ -112,6 +137,8 @@ async def request(client, url, body, headers, args):
             if calls and any(not c["id"] or not c["function"]["name"] for c in calls.values()):
                 raise ValueError("incomplete_tool_call")
             result["ok"] = True
+    except asyncio.CancelledError:
+        result["error"] = "cancelled"
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError) as exc:
         # Only locally defined codes; no arbitrary exception string in reports.
         result["error"] = str(exc) if isinstance(exc, ValueError) and str(exc) in {
@@ -122,9 +149,14 @@ async def request(client, url, body, headers, args):
     result.update(usage_metrics(usage))
     if first is not None:
         result["ttft_ms"] = (first - start) * 1000
+        # Harness-style generation: first output through completed response,
+        # distinct from last-output timing used by benchmark TPOT.
+        result["generation_ms"] = max(0, result["e2e_ms"] - result["ttft_ms"])
     if gaps:
         result["chunk_gap_mean_ms"] = statistics.mean(gaps)
     tokens = result["completion_tokens"]
+    if tokens is not None and result["generation_ms"] is not None and result["generation_ms"] > 0:
+        result["decode_tokens_per_s"] = tokens * 1000 / result["generation_ms"]
     if first is not None and tokens is not None and tokens > 1 and result["output_chunks"] > 1:
         result["tpot_ms"] = (last - first) * 1000 / (tokens - 1)
     assistant = {"role": "assistant", "content": "".join(content) or None}
@@ -132,6 +164,14 @@ async def request(client, url, body, headers, args):
         assistant["reasoning_content"] = "".join(reasoning)
     if calls:
         assistant["tool_calls"] = [calls[k] for k in sorted(calls)]
+    result["tool_calls_count"] = len(calls)
+    result["metric_unavailable"] = {
+        key: reason for key, reason in {
+            "ttft_ms": "no_output_delta" if first is None else None,
+            "tpot_ms": "missing_completion_usage" if tokens is None else "insufficient_output_samples" if result["tpot_ms"] is None else None,
+            "cache_hit_ratio": "missing_cache_usage" if result["cached_tokens"] is None else "missing_or_zero_prompt_usage" if not result["prompt_tokens"] else None,
+        }.items() if reason
+    }
     return result, assistant
 
 
@@ -160,7 +200,22 @@ def summarize(rows, elapsed):
             pairs += 1
             matches += r["backend"] == before["backend"]
         previous[sid] = r
+    timed = [r for r in success if r.get("generation_ms", 0) and r.get("completion_tokens") is not None]
+    decode_ms = sum(r["generation_ms"] for r in timed)
+    totals = {}
+    for key in ("prompt_tokens", "completion_tokens", "cached_tokens", "uncached_tokens", "reasoning_tokens", "total_tokens"):
+        values = [r[key] for r in success if r.get(key) is not None]
+        totals[key] = {"value": sum(values) if values else None, "requests": len(values)}
     return {"requests": len(rows), "success": len(success), "failed": len(rows) - len(success),
+            "sessions": len({r["session_id"] for r in rows}),
+            "token_totals": totals,
+            "llm_time_ms": sum(r["e2e_ms"] for r in rows),
+            "generation_time_ms": sum(r.get("generation_ms") or 0 for r in success),
+            "weighted_decode_tokens_per_s": sum(r["completion_tokens"] for r in timed) * 1000 / decode_ms if decode_ms else None,
+            "tool_calls": sum(r.get("tool_calls_count", 0) for r in success),
+            "finish_reasons": dict(Counter(r.get("finish_reason") for r in success)),
+            "observed_ttft_ms": distribution(r.get("ttft_ms") for r in rows),
+            "metric_unavailable": dict(Counter(f"{key}:{reason}" for r in rows for key, reason in r.get("metric_unavailable", {}).items())),
             "errors": dict(Counter(r.get("error", "unknown") for r in rows if not r["ok"])),
             "elapsed_s": elapsed, "successful_requests_per_s": len(success) / elapsed if elapsed else 0,
             "reported_output_tokens_per_s": sum(r["completion_tokens"] or 0 for r in success) / elapsed if elapsed else 0,
@@ -168,8 +223,26 @@ def summarize(rows, elapsed):
             "cache_usage_coverage": len(cache) / len(success) if success else 0,
             "weighted_cache_hit_ratio": sum(r["cached_tokens"] for r in cache) / denominator if denominator else None,
             "backend_adjacent_pairs": pairs, "backend_same_ratio": matches / pairs if pairs else None,
-            **{k: distribution(r[k] for r in success) for k in
-               ("ttft_ms", "tpot_ms", "e2e_ms", "chunk_gap_mean_ms")}}
+            **{k: distribution(r.get(k) for r in success) for k in
+               ("ttft_ms", "tpot_ms", "e2e_ms", "chunk_gap_mean_ms", "headers_ms",
+                "generation_ms", "decode_tokens_per_s", "first_text_ms", "first_reasoning_ms")}}
+
+
+def live_snapshot(rows, in_flight, elapsed, peak, lag):
+    summary = summarize(rows, elapsed)
+    active = list(in_flight.values())
+    observed = distribution(r.get("ttft_ms") for r in [*rows, *active])
+    summary.update(active=len(active), peak_in_flight=peak, observed_ttft_ms=observed,
+                   updated_at=datetime.now(timezone.utc).isoformat(),
+                   waiting_first_token=sum(r.get("ttft_ms") is None for r in active),
+                   streaming=sum(r.get("ttft_ms") is not None for r in active),
+                   event_loop_lag_ms=distribution(lag),
+                   recent_requests=[{k: r.get(k) for k in (
+                       "client_request_id", "session_index", "turn", "profile", "ok", "status",
+                       "ttft_ms", "tpot_ms", "generation_ms", "decode_tokens_per_s", "prompt_tokens",
+                       "completion_tokens", "cached_tokens", "error", "metric_unavailable")}
+                       for r in rows[-20:]])
+    return summary
 
 
 async def run(args):
@@ -190,6 +263,7 @@ async def run(args):
         print(f"Dry run (no network): {directory}")
         return 0
     rows, lag = [], []
+    in_flight = {}
     active = peak = 0
     owner = asyncio.current_task()
     next_session = 0
@@ -208,16 +282,17 @@ async def run(args):
             before = time.perf_counter()
             await asyncio.sleep(0.5)
             lag.append(max(0, time.perf_counter() - before - 0.5) * 1000)
-            progress = {"requests": len(rows), "success": sum(r["ok"] for r in rows),
-                        "active": active, "peak_in_flight": peak,
-                        "elapsed_s": time.perf_counter() - started}
-            temporary = directory / "progress.tmp"
-            temporary.write_text(json.dumps(progress), encoding="utf-8")
-            temporary.replace(directory / "progress.json")
             if (directory / "stop").exists():
                 owner.cancel()
                 return
-            if len(lag) % 20 == 0:
+            # Check stop every 0.5s, aggregate every 2s to limit client overhead.
+            if len(lag) % 4 != 1:
+                continue
+            progress = live_snapshot(rows, in_flight, time.perf_counter() - started, peak, lag)
+            temporary = directory / "progress.tmp"
+            temporary.write_text(json.dumps(progress), encoding="utf-8")
+            temporary.replace(directory / "progress.json")
+            if len(lag) % 20 == 1:
                 print(f"requests={len(rows)} active={active} peak={peak}", flush=True)
 
     with (directory / "requests.jsonl").open("w", encoding="utf-8") as output:
@@ -247,17 +322,23 @@ async def run(args):
                         build_ms = (time.perf_counter() - build_start) * 1000
                         active += 1
                         peak = max(peak, active)
+                        client_id = str(uuid.uuid4())
+                        observation = {}
+                        in_flight[client_id] = observation
                         try:
                             result, assistant = await request(client, args.base_url.rstrip("/") + "/chat/completions",
-                                                               body, request_headers, args)
+                                                               body, request_headers, args, observation)
                         finally:
                             active -= 1
+                            in_flight.pop(client_id, None)
                         result.update(run_id=run_id, session_id=sid, session_index=index, turn=turn,
                                       profile="replay" if record else profile, prefix_hash=prefix_hash,
-                                      build_ms=build_ms, client_request_id=str(uuid.uuid4()))
+                                      build_ms=build_ms, client_request_id=client_id)
                         output.write(json.dumps(result) + "\n")
                         output.flush()
                         rows.append(result)
+                        if result.get("error") == "cancelled":
+                            raise asyncio.CancelledError
                         if not result["ok"]:
                             break  # No retries: do not conceal overload or replay a broken conversation.
                         if not record:
@@ -277,7 +358,7 @@ async def run(args):
                 with contextlib.suppress(asyncio.CancelledError):
                     await monitoring
                 elapsed = time.perf_counter() - started
-                summary = summarize(rows, elapsed)
+                summary = live_snapshot(rows, {}, elapsed, peak, lag)
                 summary.update(run_id=run_id, interrupted=interrupted, peak_in_flight=peak,
                                event_loop_lag_ms=distribution(lag),
                                by_profile={p: summarize([r for r in rows if r["profile"] == p], elapsed)

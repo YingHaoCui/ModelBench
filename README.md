@@ -90,13 +90,13 @@ uv run python bench.py --model my-model --base-url http://localhost:8000/v1 --re
 modelbench.sqlite3       # 配置、状态、最终汇总
 <run UUID>/
   config.json
-  progress.json         # 运行中约每 0.5 秒更新
+  progress.json         # 运行中约每 2 秒发布指标快照
   requests.jsonl        # 逐请求指标，不保存提示词或输出文本
   summary.json          # 汇总、按画像/轮次分组
   worker.log
 ```
 
-一次只运行一个任务，防止多次发流互相干扰。点击停止会取消在途请求，保存已完成请求的部分报告；被取消的在途请求不计入完成请求数。服务正常关闭会停止子进程。异常退出/断电后，SQLite 中运行中记录会在下次启动标记为 interrupted；已写入的原始指标文件仍保留，但不自动恢复负载。历史列表展示最近 100 个任务，旧记录仍保存在 SQLite。
+一次只运行一个任务，防止多次发流互相干扰。点击停止会取消在途请求，保存已完成请求的部分报告；被取消的在途 HTTP 请求以 cancelled 记录，并保留取消前已观测到的 TTFT；尚未发起的请求不计入。服务正常关闭会停止子进程。异常退出/断电后，SQLite 中运行中记录会在下次启动标记为 interrupted；已写入的原始指标文件仍保留，但不自动恢复负载。历史列表展示最近 100 个任务，旧记录仍保存在 SQLite。
 
 命令行也可独立运行：
 
@@ -112,7 +112,8 @@ CLI 默认输出到 `results/`，不写 SQLite。dry-run 不联网，写一个�
 ```powershell
 uv sync --group dev
 uv run python -m pytest -q
-node --check frontend/app.js  # 可选，只有检查 JS 时需要 Node
+node --test tests/frontend.test.cjs  # 前端指标渲染测试（需要 Node）
+node --check frontend/app.js
 ```
 
 测试只使用本机模拟 SSE 服务，覆盖分片解析、多行事件、工具参数拼接、断流/HTTP 错误、指标缺失、前缀差异、真实子进程启动/停止、并发上限、配置校验、SQLite 重启和报告下载。不会连接真实推理集群。
@@ -127,3 +128,18 @@ node --check frontend/app.js  # 可选，只有检查 JS 时需要 Node
 - [Codex client 实现](https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs)：确认其 Responses/WebSocket 与会话/turn 状态机制，不能将普通 Chat Completions 画像称为原生 Codex 请求。
 
 本版本选择轻量独立实现，以便 PC 本地使用和调节会话/前缀实验变量。后续高精度优先引入真实脱敏 trace，再增加原生协议适配与独立 tokenizer 长度校验。
+
+## 实时统计与 Harness 口径（2026-11-04）
+
+修复：旧前端只读取任务结束时的 `summary.json`，导致运行过程中 TTFT/TPOT 始终显示空值。现在读取 `summary ?? progress`，发流进程约每 2 秒发布快照，界面约每 2 秒刷新；通常在首 token 到达后 4 秒内可见，不必等待当前请求结束。
+
+参考本地 DeepSeek Harness 的 `packages/client/ui-chat/src/client/chat/StatsPills.tsx`、`packages/client/ui-chat/src/client/contract/turn-metrics.ts`、`packages/session/session-stats/src/projection.ts` 和 LLM stream/usage 实现，独立实现以下口径（未复制其源码）：
+
+- **已观测 TTFT**：所有已结束请求和正在生成请求的已知首 token 延迟，包含失败/取消请求；样本数明确展示。下方延迟分布仍只统计成功请求，避免无声改变原有性能口径。
+- **状态拆分**：等待首 token、正在生成、在途请求、峰值并发、完成/失败请求数。
+- **生成耗时**：首个输出到响应完成；与 TPOT 使用的首输出到最后输出块区间分开。生成速度按有 usage 的同一批成功请求 `sum(output tokens) / sum(generation seconds)` 计算，单个请求的速度也写入 JSONL。
+- **时间拆分**：响应头时间、首正文、首 reasoning、TTFT、TPOT、生成耗时、E2E、SSE 块间隔；均有样本数、均值、P50/P95/P99。运行时长是墙钟时间，累计请求/生成耗时可以因并发超过墙钟时间。
+- **Token 分类**：输入总量、未缓存输入、缓存读取、输出、其中 reasoning、输入+输出总量，每类显示实际报告该字段的请求数。输入总量已包含缓存读取，不再次相加；reasoning 是输出子集。缓存写入没有当前协议的可靠统一字段，暂不推断或展示为 0。
+- **记录与诊断**：成功工具调用次数、finish reason 计数、最近 20 条已结束请求、缺失指标原因。缺失 usage 保留 null，不把 SSE 块/字符数量当 token 数；原始 JSONL 另记录输出字符数、工具参数字符数和 SSE 事件数。
+
+界面不显示 Harness 的真实工具执行耗时，因为本工具不会执行模型返回的命令。新字段仅对升级后运行的任务生效，旧报告不会伪造或回填无法恢复的时间信息。
